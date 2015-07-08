@@ -2,8 +2,10 @@
 use std::borrow::Cow;
 use std::cmp::min;
 use std::fmt;
+use std::mem;
 use std::io::{self, Write, BufWriter, BufRead, Read};
 use std::net::Shutdown;
+use std::ptr;
 #[cfg(feature = "timeouts")]
 use std::time::Duration;
 
@@ -159,6 +161,8 @@ impl HttpMessage for Http11Message {
     }
 
     fn get_incoming(&mut self) -> ::Result<ResponseHead> {
+        unimplemented!();
+        /*
         try!(self.flush_outgoing());
         let stream = match self.stream.take() {
             Some(stream) => stream,
@@ -240,14 +244,12 @@ impl HttpMessage for Http11Message {
             raw_status: raw_status,
             version: head.version,
         })
+        */
     }
 
     fn has_body(&self) -> bool {
         match self.reader {
-            Some(EmptyReader(..)) |
-            Some(SizedReader(_, 0)) |
-            Some(ChunkedReader(_, Some(0))) => false,
-            // specifically EofReader is always true
+            Some(ref r) => r.has_body(),
             _ => true
         }
     }
@@ -457,6 +459,16 @@ impl<R: Read> HttpReader<R> {
             EmptyReader(ref mut r) => r,
         }
     }
+
+    pub fn has_body(&self) -> bool {
+        match *self {
+            EmptyReader(..) |
+            SizedReader(_, 0) |
+            ChunkedReader(_, Some(0)) => false,
+            // specifically EofReader is always true
+            _ => true
+        }
+    }
 }
 
 impl<R> fmt::Debug for HttpReader<R> {
@@ -632,7 +644,7 @@ fn should_have_response_body(method: &Method, status: u16) -> bool {
 
 /// Writers to handle different Transfer-Encodings.
 pub enum HttpWriter<W: Write> {
-    /// A no-op Writer, used initially before Transfer-Encoding is determined.
+    /// A pass-through Writer, used initially before Transfer-Encoding is determined.
     ThroughWriter(W),
     /// A Writer for when Transfer-Encoding includes `chunked`.
     ChunkedWriter(W),
@@ -648,11 +660,15 @@ impl<W: Write> HttpWriter<W> {
     /// Unwraps the HttpWriter and returns the underlying Writer.
     #[inline]
     pub fn into_inner(self) -> W {
-        match self {
-            ThroughWriter(w) => w,
-            ChunkedWriter(w) => w,
-            SizedWriter(w, _) => w,
-            EmptyWriter(w) => w,
+        unsafe {
+            let w = ptr::read(match self {
+                ThroughWriter(ref w) => w,
+                ChunkedWriter(ref w) => w,
+                SizedWriter(ref w, _) => w,
+                EmptyWriter(ref w) => w,
+            });
+            mem::forget(self);
+            w
         }
     }
 
@@ -754,6 +770,19 @@ impl<W: Write> Write for HttpWriter<W> {
     }
 }
 
+impl<W: Write> Drop for HttpWriter<W> {
+    fn drop(&mut self) {
+        match *self {
+            ChunkedWriter(..) => {
+                if let Err(e) = self.write(&[]) {
+                    error!("error writing end chunk: {}", e);
+                }
+            },
+            _ => ()
+        }
+    }
+}
+
 impl<W: Write> fmt::Debug for HttpWriter<W> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -769,41 +798,27 @@ const MAX_HEADERS: usize = 100;
 
 /// Parses a request into an Incoming message head.
 #[inline]
-pub fn parse_request<R: Read>(buf: &mut BufReader<R>) -> ::Result<Incoming<(Method, RequestUri)>> {
-    parse::<R, httparse::Request, (Method, RequestUri)>(buf)
+pub fn parse_request(buf: &[u8]) -> ::Result<Option<(Incoming<(Method, RequestUri)>, usize)>> {
+    parse::<httparse::Request, (Method, RequestUri)>(buf)
 }
 
 /// Parses a response into an Incoming message head.
 #[inline]
-pub fn parse_response<R: Read>(buf: &mut BufReader<R>) -> ::Result<Incoming<RawStatus>> {
-    parse::<R, httparse::Response, RawStatus>(buf)
+pub fn parse_response(buf: &[u8]) -> ::Result<Option<(Incoming<RawStatus>, usize)>> {
+    parse::<httparse::Response, RawStatus>(buf)
 }
 
-fn parse<R: Read, T: TryParse<Subject=I>, I>(rdr: &mut BufReader<R>) -> ::Result<Incoming<I>> {
-    loop {
-        match try!(try_parse::<R, T, I>(rdr)) {
-            httparse::Status::Complete((inc, len)) => {
-                rdr.consume(len);
-                return Ok(inc);
-            },
-            _partial => ()
-        }
-        match try!(rdr.read_into_buf()) {
-            0 if rdr.get_buf().is_empty() => {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "Connection closed"
-                )))
-            },
-            0 => return Err(Error::TooLarge),
-            _ => ()
-        }
+fn parse<T: TryParse<Subject=I>, I>(rdr: &[u8]) -> ::Result<Option<(Incoming<I>, usize)>> {
+    match try!(try_parse::<T, I>(rdr)) {
+        httparse::Status::Complete((inc, len)) => {
+            Ok(Some((inc, len)))
+        },
+        _partial => Ok(None)
     }
 }
 
-fn try_parse<R: Read, T: TryParse<Subject=I>, I>(rdr: &mut BufReader<R>) -> TryParseResult<I> {
+fn try_parse<T: TryParse<Subject=I>, I>(buf: &[u8]) -> TryParseResult<I> {
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
-    let buf = rdr.get_buf();
     if buf.len() == 0 {
         return Ok(httparse::Status::Partial);
     }

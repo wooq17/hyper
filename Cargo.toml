@@ -1,7 +1,7 @@
 [package]
 
 name = "hyper"
-version = "0.6.13"
+version = "0.7.0-mio"
 description = "A modern HTTP library."
 readme = "README.md"
 documentation = "http://hyperium.github.io/hyper/hyper/index.html"
@@ -16,6 +16,7 @@ httparse = "0.1"
 language-tags = "0.0.7"
 log = "0.3"
 mime = "0.1"
+mio = "0.4"
 num_cpus = "0.2"
 rustc-serialize = "0.3"
 time = "0.1"
@@ -27,6 +28,12 @@ url = "0.2"
 [dependencies.cookie]
 version = "0.1"
 default-features = false
+
+[dependencies.eventual]
+git = "https://github.com/carllerche/eventual"
+
+[dependencies.tick]
+git = "https://github.com/seanmonstar/tick"
 
 [dependencies.openssl]
 version = "0.6.4"
@@ -44,8 +51,8 @@ optional = true
 env_logger = "*"
 
 [features]
-default = ["ssl"]
+default = []
 ssl = ["openssl", "cookie/secure"]
 serde-serialization = ["serde"]
 timeouts = []
-nightly = ["timeouts"]
+nightly = []

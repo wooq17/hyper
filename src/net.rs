@@ -2,8 +2,14 @@
 use std::any::{Any, TypeId};
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs, TcpStream, TcpListener, Shutdown};
+use std::net::{SocketAddr, ToSocketAddrs, Shutdown};
+//use std::net::{SocketAddr, ToSocketAddrs, TcpStream, TcpListener, Shutdown};
 use std::mem;
+
+use eventual::{Future, Async};
+use mio::tcp::{TcpStream, TcpListener};
+use mio::{Evented, Selector, Token, EventSet, PollOpt};
+use tick::Sender;
 
 #[cfg(feature = "openssl")]
 pub use self::openssl::Openssl;
@@ -20,13 +26,47 @@ pub enum Fresh {}
 /// The write-status indicating headers have been written.
 pub enum Streaming {}
 
+pub struct AsyncWriter {
+    sender: Option<Future<Sender<Vec<u8>>, ()>>
+}
+
+impl Write for AsyncWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let len = data.len();
+        let data = data.to_vec();
+        let sender = self.sender.take().expect("lost sender");
+        self.sender = Some(sender.and_then(move |sender| {
+            sender.send(data).and_then(|sender| sender)
+        }));
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AsyncWriter {
+    pub fn new(sender: Sender<Vec<u8>>) -> AsyncWriter {
+        AsyncWriter {
+            sender: Some(Future::of(sender))
+        }
+    }
+}
+
+impl Drop for AsyncWriter {
+    fn drop(&mut self) {
+        self.sender.take().unwrap().fire();
+    }
+}
+
 /// An abstraction to listen for connections on a certain port.
-pub trait NetworkListener: Clone {
+pub trait NetworkListener: Evented + Clone {
     /// The stream produced for each connection.
     type Stream: NetworkStream + Send + Clone;
 
     /// Returns an iterator of streams.
-    fn accept(&mut self) -> ::Result<Self::Stream>;
+    fn accept(&mut self) -> ::Result<Option<Self::Stream>>;
 
     /// Get the address this Listener ended up listening on.
     fn local_addr(&mut self) -> io::Result<SocketAddr>;
@@ -43,12 +83,14 @@ pub struct NetworkConnections<'a, N: NetworkListener + 'a>(&'a mut N);
 impl<'a, N: NetworkListener + 'a> Iterator for NetworkConnections<'a, N> {
     type Item = ::Result<N::Stream>;
     fn next(&mut self) -> Option<::Result<N::Stream>> {
-        Some(self.0.accept())
+        unimplemented!()
+
+        //Some(self.0.accept())
     }
 }
 
 /// An abstraction over streams that a Server can utilize.
-pub trait NetworkStream: Read + Write + Any + Send + Typeable {
+pub trait NetworkStream: NetworkRead + NetworkWrite {
     /// Get the remote address of the underlying connection.
     fn peer_addr(&mut self) -> io::Result<SocketAddr>;
     /// Set the maximum time to wait for a read to complete.
@@ -74,6 +116,14 @@ pub trait NetworkStream: Read + Write + Any + Send + Typeable {
         false
     }
 }
+
+/// Helper trait
+pub trait NetworkRead: Evented + Read + Any + Send + Typeable {}
+/// Helper trait
+pub trait NetworkWrite: Evented + Write + Any + Send + Typeable {}
+
+impl<T: Evented + Write + Any + Send + Typeable> NetworkWrite for T {}
+impl<T: Evented + Read + Any + Send + Typeable> NetworkRead for T {}
 
 /// A connector creates a NetworkStream.
 pub trait NetworkConnector {
@@ -219,7 +269,8 @@ impl HttpListener {
 
     /// Start listening to an address over HTTP.
     pub fn new<To: ToSocketAddrs>(addr: To) -> ::Result<HttpListener> {
-        Ok(HttpListener(try!(TcpListener::bind(addr))))
+        let addr = addr.to_socket_addrs().unwrap().next().unwrap();
+        Ok(HttpListener(try!(TcpListener::bind(&addr))))
     }
 
 }
@@ -228,13 +279,30 @@ impl NetworkListener for HttpListener {
     type Stream = HttpStream;
 
     #[inline]
-    fn accept(&mut self) -> ::Result<HttpStream> {
-        Ok(HttpStream(try!(self.0.accept()).0))
+    fn accept(&mut self) -> ::Result<Option<HttpStream>> {
+        Ok(try!(self.0.accept()).map(HttpStream))
     }
 
     #[inline]
     fn local_addr(&mut self) -> io::Result<SocketAddr> {
         self.0.local_addr()
+    }
+}
+
+impl Evented for HttpListener {
+    #[inline]
+    fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        self.0.register(selector, token, interest, opts)
+    }
+
+    #[inline]
+    fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        self.0.reregister(selector, token, interest, opts)
+    }
+
+    #[inline]
+    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+        self.0.deregister(selector)
     }
 }
 
@@ -300,6 +368,23 @@ impl Write for HttpStream {
     }
 }
 
+impl Evented for HttpStream {
+    #[inline]
+    fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        self.0.register(selector, token, interest, opts)
+    }
+
+    #[inline]
+    fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        self.0.reregister(selector, token, interest, opts)
+    }
+
+    #[inline]
+    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+        self.0.deregister(selector)
+    }
+}
+
 #[cfg(windows)]
 impl ::std::os::windows::io::AsRawSocket for HttpStream {
     fn as_raw_socket(&self) -> ::std::os::windows::io::RawSocket {
@@ -348,6 +433,11 @@ impl NetworkStream for HttpStream {
 
     #[inline]
     fn close(&mut self, how: Shutdown) -> io::Result<()> {
+        let how = match how {
+            Shutdown::Read => ::mio::tcp::Shutdown::Read,
+            Shutdown::Write => ::mio::tcp::Shutdown::Write,
+            Shutdown::Both => ::mio::tcp::Shutdown::Both,
+        };
         match self.0.shutdown(how) {
             Ok(_) => Ok(()),
             // see https://github.com/hyperium/hyper/issues/508
@@ -365,11 +455,11 @@ impl NetworkConnector for HttpConnector {
     type Stream = HttpStream;
 
     fn connect(&self, host: &str, port: u16, scheme: &str) -> ::Result<HttpStream> {
-        let addr = &(host, port);
+        let addr = (host, port).to_socket_addrs().unwrap().next().unwrap();
         Ok(try!(match scheme {
             "http" => {
                 debug!("http scheme");
-                Ok(HttpStream(try!(TcpStream::connect(addr))))
+                Ok(HttpStream(try!(TcpStream::connect(&addr))))
             },
             _ => {
                 Err(io::Error::new(io::ErrorKind::InvalidInput,
@@ -455,6 +545,32 @@ impl<S: NetworkStream> Write for HttpsStream<S> {
     }
 }
 
+impl<S: NetworkStream> Evented for HttpsStream<S> {
+    #[inline]
+    fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        match *self {
+            HttpsStream::Http(ref s) => s.register(selector, token, interest, opts),
+            HttpsStream::Https(ref s) => s.register(selector, token, interest, opts),
+        }
+    }
+
+    #[inline]
+    fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        match *self {
+            HttpsStream::Http(ref s) => s.reregister(selector, token, interest, opts),
+            HttpsStream::Https(ref s) => s.reregister(selector, token, interest, opts),
+        }
+    }
+
+    #[inline]
+    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+        match *self {
+            HttpsStream::Http(ref s) => s.deregister(selector),
+            HttpsStream::Https(ref s) => s.deregister(selector),
+        }
+    }
+}
+
 impl<S: NetworkStream> NetworkStream for HttpsStream<S> {
     #[inline]
     fn peer_addr(&mut self) -> io::Result<SocketAddr> {
@@ -514,13 +630,33 @@ impl<S: Ssl + Clone> NetworkListener for HttpsListener<S> {
     type Stream = S::Stream;
 
     #[inline]
-    fn accept(&mut self) -> ::Result<S::Stream> {
-        self.listener.accept().and_then(|s| self.ssl.wrap_server(s))
+    fn accept(&mut self) -> ::Result<Option<S::Stream>> {
+        self.listener.accept().and_then(|s| match s {
+            Some(s) => self.ssl.wrap_server(s).map(Some),
+            None => Ok(None),
+        }).map_err(From::from)
     }
 
     #[inline]
     fn local_addr(&mut self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+}
+
+impl<S: Ssl> Evented for HttpsListener<S> {
+    #[inline]
+    fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        self.listener.register(selector, token, interest, opts)
+    }
+
+    #[inline]
+    fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        self.listener.reregister(selector, token, interest, opts)
+    }
+
+    #[inline]
+    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+        self.listener.deregister(selector)
     }
 }
 
@@ -541,10 +677,10 @@ impl<S: Ssl> NetworkConnector for HttpsConnector<S> {
     type Stream = HttpsStream<S::Stream>;
 
     fn connect(&self, host: &str, port: u16, scheme: &str) -> ::Result<Self::Stream> {
-        let addr = &(host, port);
+        let addr = (host, port).to_socket_addrs().unwrap().next().unwrap();
         if scheme == "https" {
             debug!("https scheme");
-            let stream = HttpStream(try!(TcpStream::connect(addr)));
+            let stream = HttpStream(try!(TcpStream::connect(&addr)));
             self.ssl.wrap_client(stream, host).map(HttpsStream::Https)
         } else {
             HttpConnector.connect(host, port, scheme).map(HttpsStream::Http)

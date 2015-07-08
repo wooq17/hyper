@@ -2,22 +2,23 @@
 //!
 //! These are requests that a `hyper::Server` receives, and include its method,
 //! target URI, headers, and message body.
-use std::io::{self, Read};
+use std::io::{self, Read, Cursor};
 use std::net::SocketAddr;
 
-use buffer::BufReader;
-use net::NetworkStream;
+use eventual::{Async, Future};
+
 use version::{HttpVersion};
 use method::Method::{self, Get, Head};
 use header::{Headers, ContentLength, TransferEncoding};
-use http::h1::{self, Incoming, HttpReader};
+use http::h1::{Incoming, HttpReader};
 use http::h1::HttpReader::{SizedReader, ChunkedReader, EmptyReader};
 use uri::RequestUri;
 
 /// A request bundles several parts of an incoming `NetworkStream`, given to a `Handler`.
-pub struct Request<'a, 'b: 'a> {
+#[derive(Debug)]
+pub struct Request {
     /// The IP address of the remote connection.
-    pub remote_addr: SocketAddr,
+    //pub remote_addr: SocketAddr,
     /// The `Method`, such as `Get`, `Post`, etc.
     pub method: Method,
     /// The headers of the incoming request.
@@ -26,48 +27,66 @@ pub struct Request<'a, 'b: 'a> {
     pub uri: RequestUri,
     /// The version of HTTP for this request.
     pub version: HttpVersion,
-    body: HttpReader<&'a mut BufReader<&'b mut NetworkStream>>
+
+    stream: Option<::eventual::Stream<Vec<u8>, ::Error>>
 }
 
 
-impl<'a, 'b: 'a> Request<'a, 'b> {
+impl Request {
     /// Create a new Request, reading the StartLine and Headers so they are
     /// immediately useful.
-    pub fn new(mut stream: &'a mut BufReader<&'b mut NetworkStream>, addr: SocketAddr)
-        -> ::Result<Request<'a, 'b>> {
-
-        let Incoming { version, subject: (method, uri), headers } = try!(h1::parse_request(stream));
+    pub fn new(incoming: Incoming<(Method, RequestUri)>, buf: Cursor<Vec<u8>>, stream: ::tick::Stream<Vec<u8>>) -> Request {
+        let Incoming { version, subject: (method, uri), headers } = incoming;
         debug!("Request Line: {:?} {:?} {:?}", method, uri, version);
-        debug!("{:?}", headers);
+        debug!("{:#?}", headers);
 
         let body = if method == Get || method == Head {
-            EmptyReader(stream)
-        } else if headers.has::<ContentLength>() {
-            match headers.get::<ContentLength>() {
-                Some(&ContentLength(len)) => SizedReader(stream, len),
-                None => unreachable!()
-            }
+            EmptyReader(buf)
+        } else if let Some(&ContentLength(len)) = headers.get() {
+            SizedReader(buf, len)
         } else if headers.has::<TransferEncoding>() {
             todo!("check for Transfer-Encoding: chunked");
-            ChunkedReader(stream, None)
+            ChunkedReader(buf, None)
         } else {
-            EmptyReader(stream)
+            EmptyReader(buf)
         };
 
-        Ok(Request {
-            remote_addr: addr,
+        Request {
+            //remote_addr: addr,
             method: method,
             uri: uri,
             headers: headers,
             version: version,
-            body: body
-        })
+            stream: Some(http_stream(body, stream))
+        }
     }
 
+    pub fn read(mut self) -> Future<(Vec<u8>, Request), (::Error, Request)> {
+        let (complete, future) = Future::pair();
+        self.stream.take().expect("Request Stream lost").receive(move |res| {
+            match res {
+                Ok(Some((vec, stream))) => {
+                    self.stream = Some(stream);
+                    complete.complete((vec, self))
+                },
+                Ok(None) => panic!("stream is empty?"),
+                Err(e) => if let Some(e) = e.take() {
+                    complete.fail((e, self))
+                }
+            }
+        });
+        future
+    }
+
+    pub fn stream(mut self) -> ::eventual::Stream<Vec<u8>, ::Error> {
+        self.stream.take().expect("Request Stream lost")
+    }
+
+    /*
     /// Get a reference to the underlying `NetworkStream`.
     #[inline]
-    pub fn downcast_ref<T: NetworkStream>(&self) -> Option<&T> {
-        self.body.get_ref().get_ref().downcast_ref()
+    pub fn downcast_ref<T: Read>(&self) -> Option<&T> {
+        self.body.get_ref().downcast_ref()
     }
 
     /// Get a reference to the underlying Ssl stream, if connected
@@ -89,7 +108,7 @@ impl<'a, 'b: 'a> Request<'a, 'b> {
     /// # }
     /// ```
     #[inline]
-    pub fn ssl<T: NetworkStream>(&self) -> Option<&T> {
+    pub fn ssl<T: Read>(&self) -> Option<&T> {
         use ::net::HttpsStream;
         match self.downcast_ref() {
             Some(&HttpsStream::Https(ref s)) => Some(s),
@@ -101,18 +120,77 @@ impl<'a, 'b: 'a> Request<'a, 'b> {
     #[inline]
     pub fn deconstruct(self) -> (SocketAddr, Method, Headers,
                                  RequestUri, HttpVersion,
-                                 HttpReader<&'a mut BufReader<&'b mut NetworkStream>>) {
+                                 HttpReader<&'s mut NetworkRead>) {
         (self.remote_addr, self.method, self.headers,
          self.uri, self.version, self.body)
     }
+    */
 }
 
-impl<'a, 'b> Read for Request<'a, 'b> {
-    #[inline]
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.body.read(buf)
-    }
+fn read_buf<R: Read>(buf: &mut R, len: usize) -> ::Result<Vec<u8>> {
+    let mut v = vec![0; len];
+    let count = try!(buf.read(&mut v));
+    v.truncate(count);
+    Ok(v)
 }
+
+fn http_stream(buf: HttpReader<Cursor<Vec<u8>>>, rx: ::tick::Stream<Vec<u8>>) -> ::eventual::Stream<Vec<u8>, ::Error> {
+    let (tx, stream) = ::eventual::Stream::pair();
+    do_http_stream(buf, tx, rx);
+    stream
+}
+
+fn do_http_stream<A>(mut buf: HttpReader<Cursor<Vec<u8>>>, tx: A, stream: ::tick::Stream<Vec<u8>>)
+where A: Async<Value=::eventual::Sender<Vec<u8>, ::Error>> {
+    tx.receive(move |res| {
+        if let Ok(tx) = res {
+            if !buf.has_body() {
+                tx.send(vec![]);
+            } else {
+                let left = buf.get_ref().get_ref().len() - (buf.get_ref().position() as usize);
+                if left > 0 {
+                    match read_buf(&mut buf, left) {
+                        Ok(v) => do_http_stream(buf, tx.send(v), stream),
+                        Err(e) => tx.fail(e.into())
+                    }
+                } else {
+                    stream.receive(move |res| {
+                        match res {
+                            Ok(Some((bytes, stream))) => {
+                                let len = bytes.len();
+                                {
+                                    let mut cursor = buf.get_mut();
+                                    cursor.set_position(0);
+                                    *cursor.get_mut() = bytes;
+                                }
+                                match read_buf(&mut buf, len) {
+                                    Ok(v) => do_http_stream(buf, tx.send(v), stream),
+                                    Err(e) => tx.fail(e.into())
+                                }
+                            },
+                            Ok(None) => {
+                                // eof
+                                match read_buf(&mut buf, 1) {
+                                    Ok(v) => { tx.send(v); }
+                                    Err(e) => { tx.fail(e.into()); }
+                                }
+                            },
+                            Err(e) => {
+                                if let Some(e) = e.take() {
+                                    tx.fail(e.into());
+                                } else {
+                                    panic!("stream aborted?!");
+                                }
+                                return;
+                            }
+                        };
+                    });
+                }
+            }
+        }
+    });
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -186,6 +264,7 @@ mod tests {
         assert_eq!(read_to_string(req).unwrap(), "".to_owned());
     }
 
+    /*
     #[test]
     fn test_parse_chunked_request() {
         let mut mock = MockStream::with_input(b"\
@@ -297,6 +376,6 @@ mod tests {
         let req = Request::new(&mut stream, sock("127.0.0.1:80")).unwrap();
 
         assert_eq!(read_to_string(req).unwrap(), "1".to_owned());
-    }
+    }*/
 
 }

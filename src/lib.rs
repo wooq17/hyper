@@ -143,6 +143,9 @@ extern crate num_cpus;
 extern crate traitobject;
 extern crate typeable;
 extern crate solicit;
+extern crate mio;
+extern crate eventual;
+extern crate tick;
 
 #[macro_use]
 extern crate language_tags;

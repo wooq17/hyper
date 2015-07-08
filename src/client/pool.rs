@@ -5,6 +5,8 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, Shutdown};
 use std::sync::{Arc, Mutex};
 
+use mio::{Evented, Selector, Token, EventSet, PollOpt};
+
 #[cfg(feature = "timeouts")]
 use std::time::Duration;
 
@@ -167,6 +169,23 @@ impl<S: NetworkStream> Write for PooledStream<S> {
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
         self.inner.as_mut().unwrap().stream.flush()
+    }
+}
+
+impl<S: NetworkStream> Evented for PooledStream<S> {
+    #[inline]
+    fn register(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        self.inner.as_ref().unwrap().stream.register(selector, token, interest, opts)
+    }
+
+    #[inline]
+    fn reregister(&self, selector: &mut Selector, token: Token, interest: EventSet, opts: PollOpt) -> io::Result<()> {
+        self.inner.as_ref().unwrap().stream.reregister(selector, token, interest, opts)
+    }
+
+    #[inline]
+    fn deregister(&self, selector: &mut Selector) -> io::Result<()> {
+        self.inner.as_ref().unwrap().stream.deregister(selector)
     }
 }
 

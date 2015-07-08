@@ -2,26 +2,20 @@
 extern crate hyper;
 extern crate env_logger;
 
-use std::io::copy;
+extern crate eventual;
+use eventual::Async;
 
 use hyper::{Get, Post};
+use hyper::header::ContentLength;
 use hyper::server::{Server, Request, Response};
 use hyper::uri::RequestUri::AbsolutePath;
 
-macro_rules! try_return(
-    ($e:expr) => {{
-        match $e {
-            Ok(v) => v,
-            Err(e) => { println!("Error: {}", e); return; }
-        }
-    }}
-);
 
-fn echo(mut req: Request, mut res: Response) {
+fn echo(req: Request, mut res: Response) {
     match req.uri {
         AbsolutePath(ref path) => match (&req.method, &path[..]) {
             (&Get, "/") | (&Get, "/echo") => {
-                try_return!(res.send(b"Try POST /echo"));
+                res.send(b"Try POST /echo");
                 return;
             },
             (&Post, "/echo") => (), // fall through, fighting mutable borrows
@@ -35,8 +29,16 @@ fn echo(mut req: Request, mut res: Response) {
         }
     };
 
-    let mut res = try_return!(res.start());
-    try_return!(copy(&mut req, &mut res));
+    if let Some(len) = req.headers.get::<ContentLength>() {
+        res.headers_mut().set(*len);
+    }
+
+    let mut res = res.start();
+    req.stream().each(move |data| {
+        println!("data: {:?}", data);
+        res.write(&data);
+    }).fire();
+    println!("handler end");
 }
 
 fn main() {

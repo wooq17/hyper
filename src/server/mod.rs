@@ -108,14 +108,19 @@
 //! `Request<Streaming>` object, that no longer has `headers_mut()`, but does
 //! implement `Write`.
 use std::fmt;
-use std::io::{self, ErrorKind, BufWriter, Write};
+use std::io::{self, ErrorKind, BufWriter, Write, Read, Cursor};
+use std::marker::PhantomData;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 #[cfg(feature = "timeouts")]
 use std::time::Duration;
 
 use num_cpus;
+
+use mio::{self, EventLoop, EventSet, PollOpt};
+use tick::{Async, Tick};
 
 pub use self::request::Request;
 pub use self::response::Response;
@@ -124,28 +129,25 @@ pub use net::{Fresh, Streaming};
 
 use Error;
 use buffer::BufReader;
-use header::{Headers, Expect, Connection};
+use header::{self, Headers, Expect};
 use http;
 use method::Method;
 use net::{NetworkListener, NetworkStream, HttpListener, HttpsListener, Ssl};
+use net::{NetworkWrite, NetworkRead};
 use status::StatusCode;
 use uri::RequestUri;
 use version::HttpVersion::Http11;
 
-use self::listener::ListenerPool;
-
 pub mod request;
 pub mod response;
-
-mod listener;
 
 /// A server can listen on a TCP socket.
 ///
 /// Once listening, it will create a `Request`/`Response` pair for each
 /// incoming connection, and hand them to the provided handler.
 #[derive(Debug)]
-pub struct Server<L = HttpListener> {
-    listener: L,
+pub struct Server {
+    listener: ::mio::tcp::TcpListener,
     _timeouts: Timeouts,
 }
 
@@ -160,6 +162,7 @@ struct Timeouts {
 #[derive(Clone, Copy, Default, Debug)]
 struct Timeouts;
 
+
 macro_rules! try_option(
     ($e:expr) => {{
         match $e {
@@ -169,14 +172,20 @@ macro_rules! try_option(
     }}
 );
 
-impl<L: NetworkListener> Server<L> {
+impl Server {
     /// Creates a new server with the provided handler.
     #[inline]
-    pub fn new(listener: L) -> Server<L> {
+    pub fn new(listener: ::mio::tcp::TcpListener) -> Server {
         Server {
             listener: listener,
             _timeouts: Timeouts::default(),
         }
+    }
+
+    pub fn http(addr: &str) -> ::Result<Server> {
+        ::mio::tcp::TcpListener::bind(&addr.parse().unwrap())
+            .map(Server::new)
+            .map_err(From::from)
     }
 
     #[cfg(feature = "timeouts")]
@@ -192,6 +201,7 @@ impl<L: NetworkListener> Server<L> {
 
 }
 
+/*
 impl Server<HttpListener> {
     /// Creates a new server that will handle `HttpStream`s.
     pub fn http<To: ToSocketAddrs>(addr: To) -> ::Result<Server<HttpListener>> {
@@ -207,38 +217,125 @@ impl<S: Ssl + Clone + Send> Server<HttpsListener<S>> {
         HttpsListener::new(addr, ssl).map(Server::new)
     }
 }
+*/
 
-impl<L: NetworkListener + Send + 'static> Server<L> {
+use eventual::Future;
+fn parse(stream: ::tick::Stream<Vec<u8>>) -> Future<Request, ::Error> {
+    let (defer, future) = Future::pair();
+    defer.receive(move |result| {
+        if let Ok(defer) = result {
+            do_parse(vec![], stream, defer);
+        }
+    });
+    future
+}
+
+fn do_parse(mut buf: Vec<u8>, stream: ::tick::Stream<Vec<u8>>, defer: ::eventual::Complete<Request, ::Error>) {
+    use http::h1;
+    stream.receive(move |result| {
+        match result {
+            Ok(Some((bytes, stream))) => {
+                buf.extend(&bytes);
+                match h1::parse_request(&buf) {
+                    Ok(Some((incoming, pos))) => {
+                        let mut buf = Cursor::new(buf);
+                        buf.set_position(pos as u64);
+                        let request = Request::new(incoming, buf, stream);
+                        defer.complete(request);
+                    }
+                    Ok(None) => {
+                        // if buf.len() < MAX_HEAD_SIZE
+                        do_parse(buf, stream, defer);
+                    },
+                    Err(e) => defer.fail(e)
+                }
+
+            },
+            Ok(None) => {
+                // eof before parsing succeeded... error
+            }
+            Err(::eventual::AsyncError::Failed(e)) => defer.fail(From::from(e)),
+            Err(::eventual::AsyncError::Aborted) => {
+                trace!("what does this mean, aborted?");
+            }
+        }
+    });
+}
+
+impl Server {
     /// Binds to a socket and starts handling connections.
     pub fn handle<H: Handler + 'static>(self, handler: H) -> ::Result<Listening> {
-        self.handle_threads(handler, num_cpus::get() * 5 / 4)
+        let handler = ::std::sync::Arc::new(handler);
+        let tick = try!(Tick::new());
+        let addr = try!(self.listener.local_addr());
+        let stream = tick.accept(self.listener)
+            .each(move |(write, read)| {
+                debug!("Socket start");
+                let handler = handler.clone();
+                let mut resp = Response::new(write);
+                parse(read).receive(move |res| {
+                    match res {
+                        Ok(request) => {
+                            handler.handle(request, resp);
+                        }
+                        Err(e) => {
+                            trace!("error parsing: {:?}", e);
+                            *resp.status_mut() = ::status::StatusCode::BadRequest;
+                        }
+                    }
+                })
+            }).map_err(|e| error!("tick error: {:?}", e));
+        Ok(Listening {
+            addr: addr,
+            tick: Some(tick),
+            receiver: Some(stream),
+        })
+        //self.handle_threads(handler, num_cpus::get() * 5 / 4)
     }
+
+    /*
     /// Binds to a socket and starts handling connections with the provided
     /// number of threads.
-    pub fn handle_threads<H: Handler + 'static>(self, handler: H,
-            threads: usize) -> ::Result<Listening> {
+    pub fn handle_threads<H: Handler + 'static>(self, handler: H, threads: usize) -> ::Result<Listening> {
         handle(self, handler, threads)
+    }
+    */
+}
+
+/// A handle of the running server.
+pub struct Listening {
+    /// The address this server is listening on.
+    pub addr: SocketAddr,
+    tick: Option<Tick>,
+    receiver: Option<::eventual::Future<(), ()>>,
+}
+
+impl fmt::Debug for Listening {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Listening")
+            .field("addr", &self.addr)
+            .finish()
     }
 }
 
-fn handle<H, L>(mut server: Server<L>, handler: H, threads: usize) -> ::Result<Listening>
-where H: Handler + 'static,
-L: NetworkListener + Send + 'static {
-    let socket = try!(server.listener.local_addr());
-
-    debug!("threads = {:?}", threads);
-    let pool = ListenerPool::new(server.listener);
-    let worker = Worker::new(handler, server._timeouts);
-    let work = move |mut stream| worker.handle_connection(&mut stream);
-
-    let guard = thread::spawn(move || pool.accept(work, threads));
-
-    Ok(Listening {
-        _guard: Some(guard),
-        socket: socket,
-    })
+impl Drop for Listening {
+    fn drop(&mut self) {
+        let _ = self.receiver.take().map(|s| s.await());
+    }
 }
 
+impl Listening {
+    /// Starts the Server, blocking until it is shutdown.
+    pub fn start(self) {
+
+    }
+    /// Stop the server from listening to its socket address.
+    pub fn close(&mut self) {
+        debug!("closing server");
+        self.tick.take();
+    }
+}
+/*
 struct Worker<H: Handler + 'static> {
     handler: H,
     _timeouts: Timeouts,
@@ -324,7 +421,7 @@ impl<H: Handler + 'static> Worker<H> {
             let version = req.version;
             let mut res_headers = Headers::new();
             if !keep_alive {
-                res_headers.set(Connection::close());
+                res_headers.set(header::Connection::close());
             }
             {
                 let mut res = Response::new(&mut wrt, &mut res_headers);
@@ -363,40 +460,15 @@ impl<H: Handler + 'static> Worker<H> {
     }
 }
 
-/// A listening server, which can later be closed.
-pub struct Listening {
-    _guard: Option<JoinHandle<()>>,
-    /// The socket addresses that the server is bound to.
-    pub socket: SocketAddr,
-}
+*/
 
-impl fmt::Debug for Listening {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Listening {{ socket: {:?} }}", self.socket)
-    }
-}
-
-impl Drop for Listening {
-    fn drop(&mut self) {
-        let _ = self._guard.take().map(|g| g.join());
-    }
-}
-
-impl Listening {
-    /// Stop the server from listening to its socket address.
-    pub fn close(&mut self) -> ::Result<()> {
-        let _ = self._guard.take();
-        debug!("closing server");
-        Ok(())
-    }
-}
 
 /// A handler that can handle incoming requests for a server.
 pub trait Handler: Sync + Send {
     /// Receives a `Request`/`Response` pair, and should perform some action on them.
     ///
     /// This could reading from the request, and writing to the response.
-    fn handle<'a, 'k>(&'a self, Request<'a, 'k>, Response<'a, Fresh>);
+    fn handle(&self, Request, Response<Fresh>);
 
     /// Called when a Request includes a `Expect: 100-continue` header.
     ///
@@ -418,7 +490,7 @@ pub trait Handler: Sync + Send {
 }
 
 impl<F> Handler for F where F: Fn(Request, Response<Fresh>), F: Sync + Send {
-    fn handle<'a, 'k>(&'a self, req: Request<'a, 'k>, res: Response<'a, Fresh>) {
+    fn handle(&self, req: Request, res: Response<Fresh>) {
         self(req, res)
     }
 }
@@ -459,7 +531,7 @@ mod tests {
     fn test_check_continue_reject() {
         struct Reject;
         impl Handler for Reject {
-            fn handle<'a, 'k>(&'a self, _: Request<'a, 'k>, res: Response<'a, Fresh>) {
+            fn handle(&self, _: Request, res: Response<Fresh>) {
                 res.start().unwrap().end().unwrap();
             }
 
