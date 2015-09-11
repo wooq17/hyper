@@ -108,18 +108,14 @@
 //! `Request<Streaming>` object, that no longer has `headers_mut()`, but does
 //! implement `Write`.
 use std::fmt;
-use std::io::{self, ErrorKind, BufWriter, Write, Read, Cursor};
-use std::marker::PhantomData;
+use std::io::{/*self, ErrorKind, BufWriter, Write,*/ Read, Cursor};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
 
 #[cfg(feature = "timeouts")]
 use std::time::Duration;
 
-use num_cpus;
+//use num_cpus;
 
-use mio::{self, EventLoop, EventSet, PollOpt};
 use tick::{Async, Tick};
 
 pub use self::request::Request;
@@ -128,18 +124,18 @@ pub use self::response::Response;
 pub use net::{Fresh, Streaming};
 
 use Error;
-use buffer::BufReader;
-use header::{self, Headers, Expect};
-use http;
+use header::{self, Headers};
+//use http;
 use method::Method;
-use net::{NetworkListener, NetworkStream, HttpListener, HttpsListener, Ssl};
-use net::{NetworkWrite, NetworkRead};
+//use net::{NetworkListener, NetworkStream, HttpListener, HttpsListener, Ssl};
 use status::StatusCode;
 use uri::RequestUri;
-use version::HttpVersion::Http11;
+
+use self::conn::Connection;
 
 pub mod request;
 pub mod response;
+mod conn;
 
 /// A server can listen on a TCP socket.
 ///
@@ -219,49 +215,6 @@ impl<S: Ssl + Clone + Send> Server<HttpsListener<S>> {
 }
 */
 
-use eventual::Future;
-fn parse(stream: ::tick::Stream<Vec<u8>>) -> Future<Request, ::Error> {
-    let (defer, future) = Future::pair();
-    defer.receive(move |result| {
-        if let Ok(defer) = result {
-            do_parse(vec![], stream, defer);
-        }
-    });
-    future
-}
-
-fn do_parse(mut buf: Vec<u8>, stream: ::tick::Stream<Vec<u8>>, defer: ::eventual::Complete<Request, ::Error>) {
-    use http::h1;
-    stream.receive(move |result| {
-        match result {
-            Ok(Some((bytes, stream))) => {
-                buf.extend(&bytes);
-                match h1::parse_request(&buf) {
-                    Ok(Some((incoming, pos))) => {
-                        let mut buf = Cursor::new(buf);
-                        buf.set_position(pos as u64);
-                        let request = Request::new(incoming, buf, stream);
-                        defer.complete(request);
-                    }
-                    Ok(None) => {
-                        // if buf.len() < MAX_HEAD_SIZE
-                        do_parse(buf, stream, defer);
-                    },
-                    Err(e) => defer.fail(e)
-                }
-
-            },
-            Ok(None) => {
-                // eof before parsing succeeded... error
-            }
-            Err(::eventual::AsyncError::Failed(e)) => defer.fail(From::from(e)),
-            Err(::eventual::AsyncError::Aborted) => {
-                trace!("what does this mean, aborted?");
-            }
-        }
-    });
-}
-
 impl Server {
     /// Binds to a socket and starts handling connections.
     pub fn handle<H: Handler + 'static>(self, handler: H) -> ::Result<Listening> {
@@ -272,19 +225,8 @@ impl Server {
             .each(move |(write, read)| {
                 debug!("Socket start");
                 let handler = handler.clone();
-                let mut resp = Response::new(write);
-                parse(read).receive(move |res| {
-                    match res {
-                        Ok(request) => {
-                            handler.handle(request, resp);
-                        }
-                        Err(e) => {
-                            trace!("error parsing: {:?}", e);
-                            *resp.status_mut() = ::status::StatusCode::BadRequest;
-                        }
-                    }
-                })
-            }).map_err(|e| error!("tick error: {:?}", e));
+                Connection::new(read, write).handle(handler)
+            }).map_err(|e| panic!("tick error: {:?}", e));
         Ok(Listening {
             addr: addr,
             tick: Some(tick),

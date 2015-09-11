@@ -2,7 +2,7 @@
 //!
 //! These are requests that a `hyper::Server` receives, and include its method,
 //! target URI, headers, and message body.
-use std::io::{self, Read, Cursor};
+use std::io::{Read, Cursor};
 use std::net::SocketAddr;
 
 use eventual::{Async, Future};
@@ -145,7 +145,8 @@ where A: Async<Value=::eventual::Sender<Vec<u8>, ::Error>> {
     tx.receive(move |res| {
         if let Ok(tx) = res {
             if !buf.has_body() {
-                tx.send(vec![]);
+                //tx.send(vec![]);
+                drop(tx);
             } else {
                 let left = buf.get_ref().get_ref().len() - (buf.get_ref().position() as usize);
                 if left > 0 {
@@ -170,10 +171,6 @@ where A: Async<Value=::eventual::Sender<Vec<u8>, ::Error>> {
                             },
                             Ok(None) => {
                                 // eof
-                                match read_buf(&mut buf, 1) {
-                                    Ok(v) => { tx.send(v); }
-                                    Err(e) => { tx.fail(e.into()); }
-                                }
                             },
                             Err(e) => {
                                 if let Some(e) = e.take() {
