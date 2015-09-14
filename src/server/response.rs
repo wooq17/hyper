@@ -11,6 +11,7 @@ use std::ptr;
 use time::now_utc;
 
 use header;
+use http;
 use http::h1::HttpWriter::{self, ThroughWriter, ChunkedWriter, SizedWriter};
 use status;
 use net::{Fresh, Streaming, AsyncWriter};
@@ -230,6 +231,9 @@ impl<T: Any> Drop for Response<T> {
             let _body = self.write_head();
         };
         // AsyncWriter will flush on drop
+        if !http::should_keep_alive(self.version, &self.headers) {
+            self.body.get_mut().close();
+        }
     }
 }
 

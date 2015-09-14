@@ -27,7 +27,8 @@ pub enum Fresh {}
 pub enum Streaming {}
 
 pub struct AsyncWriter {
-    sender: Option<Future<Sender<Vec<u8>>, ()>>
+    sender: Option<Future<Sender<Vec<u8>>, ()>>,
+    will_close: bool,
 }
 
 impl Write for AsyncWriter {
@@ -49,14 +50,28 @@ impl Write for AsyncWriter {
 impl AsyncWriter {
     pub fn new(sender: Sender<Vec<u8>>) -> AsyncWriter {
         AsyncWriter {
-            sender: Some(Future::of(sender))
+            sender: Some(Future::of(sender)),
+            will_close: false,
         }
+    }
+
+    pub fn close(&mut self) {
+        self.will_close = true;
     }
 }
 
 impl Drop for AsyncWriter {
     fn drop(&mut self) {
-        self.sender.take().unwrap().fire();
+        let will_close = self.will_close;
+        self.sender.take().unwrap().receive(move |res| {
+            trace!("AsyncWriter.drop closing={}", will_close);
+            match res {
+                Ok(sender) => if will_close {
+                    sender.abort()
+                },
+                _ => ()
+            }
+        });
     }
 }
 

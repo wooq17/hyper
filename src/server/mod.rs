@@ -131,8 +131,6 @@ use method::Method;
 use status::StatusCode;
 use uri::RequestUri;
 
-use self::conn::Connection;
-
 pub mod request;
 pub mod response;
 mod conn;
@@ -225,7 +223,7 @@ impl Server {
             .each(move |(write, read)| {
                 debug!("Socket start");
                 let handler = handler.clone();
-                Connection::new(read, write).handle(handler)
+                self::conn::handle(write, read, handler);
             }).map_err(|e| panic!("tick error: {:?}", e));
         Ok(Listening {
             addr: addr,
