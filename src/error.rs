@@ -225,7 +225,7 @@ mod tests {
         from!(httparse::Error::Token => Header);
         from!(httparse::Error::TooManyHeaders => TooLarge);
         from!(httparse::Error::Version => Version);
-        from!(PulseError::Io(io::Error::new(io::ErrorKind::Other, "pulse")), Io(..));
+        from!(TickError::Io(io::Error::new(io::ErrorKind::Other, "tick")) => Io(..));
     }
 
     #[cfg(feature = "openssl")]
