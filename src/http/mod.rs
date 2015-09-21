@@ -10,11 +10,15 @@ use version::HttpVersion::{Http10, Http11};
 #[cfg(feature = "serde-serialization")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub use self::conn::{Conn, Handler};
 pub use self::message::{HttpMessage, RequestHead, ResponseHead, Protocol};
 
+pub mod conn;
 pub mod h1;
-pub mod h2;
+//pub mod h2;
 pub mod message;
+
+pub type Transfer = self::conn::Lease<::tick::Transfer>;
 
 /// The raw status code and reason-phrase.
 #[derive(Clone, PartialEq, Debug)]
@@ -44,6 +48,32 @@ pub fn should_keep_alive(version: HttpVersion, headers: &Headers) -> bool {
         (Http10, Some(conn)) if !conn.contains(&KeepAlive) => false,
         (Http11, Some(conn)) if conn.contains(&Close)  => false,
         _ => true
+    }
+}
+
+pub struct AsyncWriter {
+    transfer: Transfer,
+}
+
+impl AsyncWriter {
+    pub fn new(transfer: Transfer) -> AsyncWriter {
+        AsyncWriter { transfer: transfer }
+    }
+
+    pub fn get_mut(&mut self) -> &mut Transfer {
+        &mut self.transfer
+    }
+}
+
+impl ::std::io::Write for AsyncWriter {
+    fn write(&mut self, data: &[u8]) -> ::std::io::Result<usize> {
+        let len = data.len();
+        self.transfer.write(data);
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> ::std::io::Result<()> {
+        Ok(())
     }
 }
 

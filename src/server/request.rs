@@ -5,8 +5,6 @@
 use std::io::{Read, Cursor};
 use std::net::SocketAddr;
 
-use eventual::{Async, Future};
-
 use version::{HttpVersion};
 use method::Method::{self, Get, Head};
 use header::{Headers, ContentLength, TransferEncoding};
@@ -28,18 +26,19 @@ pub struct Request {
     /// The version of HTTP for this request.
     pub version: HttpVersion,
 
-    stream: Option<::eventual::Stream<Vec<u8>, ::Error>>
+    //stream: Option<::eventual::Stream<Vec<u8>, ::Error>>
 }
 
 
 impl Request {
     /// Create a new Request, reading the StartLine and Headers so they are
     /// immediately useful.
-    pub fn new(incoming: Incoming<(Method, RequestUri)>, buf: Cursor<Vec<u8>>, stream: ::tick::Stream<Vec<u8>>) -> Request {
+    pub fn new(incoming: Incoming<(Method, RequestUri)>) -> Request {
         let Incoming { version, subject: (method, uri), headers } = incoming;
         debug!("Request Line: {:?} {:?} {:?}", method, uri, version);
         debug!("{:#?}", headers);
 
+        /*
         let body = if method == Get || method == Head {
             EmptyReader(buf)
         } else if let Some(&ContentLength(len)) = headers.get() {
@@ -50,6 +49,7 @@ impl Request {
         } else {
             EmptyReader(buf)
         };
+        */
 
         Request {
             //remote_addr: addr,
@@ -57,10 +57,10 @@ impl Request {
             uri: uri,
             headers: headers,
             version: version,
-            stream: Some(http_stream(body, stream))
         }
     }
 
+    /*
     pub fn read(mut self) -> Future<(Vec<u8>, Request), (::Error, Request)> {
         let (complete, future) = Future::pair();
         self.stream.take().expect("Request Stream lost").receive(move |res| {
@@ -78,9 +78,11 @@ impl Request {
         future
     }
 
+
     pub fn stream(mut self) -> ::eventual::Stream<Vec<u8>, ::Error> {
         self.stream.take().expect("Request Stream lost")
     }
+    */
 
     /*
     /// Get a reference to the underlying `NetworkStream`.
@@ -133,61 +135,6 @@ fn read_buf<R: Read>(buf: &mut R, len: usize) -> ::Result<Vec<u8>> {
     v.truncate(count);
     Ok(v)
 }
-
-fn http_stream(buf: HttpReader<Cursor<Vec<u8>>>, rx: ::tick::Stream<Vec<u8>>) -> ::eventual::Stream<Vec<u8>, ::Error> {
-    let (tx, stream) = ::eventual::Stream::pair();
-    do_http_stream(buf, tx, rx);
-    stream
-}
-
-fn do_http_stream<A>(mut buf: HttpReader<Cursor<Vec<u8>>>, tx: A, stream: ::tick::Stream<Vec<u8>>)
-where A: Async<Value=::eventual::Sender<Vec<u8>, ::Error>> {
-    tx.receive(move |res| {
-        if let Ok(tx) = res {
-            if !buf.has_body() {
-                //tx.send(vec![]);
-                drop(tx);
-            } else {
-                let left = buf.get_ref().get_ref().len() - (buf.get_ref().position() as usize);
-                if left > 0 {
-                    match read_buf(&mut buf, left) {
-                        Ok(v) => do_http_stream(buf, tx.send(v), stream),
-                        Err(e) => tx.fail(e.into())
-                    }
-                } else {
-                    stream.receive(move |res| {
-                        match res {
-                            Ok(Some((bytes, stream))) => {
-                                let len = bytes.len();
-                                {
-                                    let mut cursor = buf.get_mut();
-                                    cursor.set_position(0);
-                                    *cursor.get_mut() = bytes;
-                                }
-                                match read_buf(&mut buf, len) {
-                                    Ok(v) => do_http_stream(buf, tx.send(v), stream),
-                                    Err(e) => tx.fail(e.into())
-                                }
-                            },
-                            Ok(None) => {
-                                // eof
-                            },
-                            Err(e) => {
-                                if let Some(e) = e.take() {
-                                    tx.fail(e.into());
-                                } else {
-                                    panic!("stream aborted?!");
-                                }
-                                return;
-                            }
-                        };
-                    });
-                }
-            }
-        }
-    });
-}
-
 
 #[cfg(test)]
 mod tests {

@@ -11,10 +11,10 @@ use std::ptr;
 use time::now_utc;
 
 use header;
-use http;
+use http::{self, AsyncWriter};
 use http::h1::HttpWriter::{self, ThroughWriter, ChunkedWriter, SizedWriter};
 use status;
-use net::{Fresh, Streaming, AsyncWriter};
+use net::{Fresh, Streaming};
 use version;
 
 
@@ -135,12 +135,12 @@ enum Body {
 impl Response<Fresh> {
     /// Creates a new Response that can be used to write to a network stream.
     #[inline]
-    pub fn new(sender: ::tick::Sender<Vec<u8>>) -> Response<Fresh> {
+    pub fn new(tx: http::Transfer) -> Response<Fresh> {
         Response {
             status: status::StatusCode::Ok,
             version: version::HttpVersion::Http11,
             headers: header::Headers::new(),
-            body: HttpWriter::ThroughWriter(AsyncWriter::new(sender)),
+            body: HttpWriter::ThroughWriter(AsyncWriter::new(tx)),
             _writing: PhantomData,
         }
     }
@@ -232,7 +232,8 @@ impl<T: Any> Drop for Response<T> {
         };
         // AsyncWriter will flush on drop
         if !http::should_keep_alive(self.version, &self.headers) {
-            self.body.get_mut().close();
+            trace!("should not keep alive, closing");
+            self.body.get_mut().get_mut().close();
         }
     }
 }

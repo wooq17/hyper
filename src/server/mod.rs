@@ -116,7 +116,8 @@ use std::time::Duration;
 
 //use num_cpus;
 
-use tick::{Async, Tick};
+use mio::{self, TryAccept};
+use tick::{Tick, Transport};
 
 pub use self::request::Request;
 pub use self::response::Response;
@@ -125,9 +126,9 @@ pub use net::{Fresh, Streaming};
 
 use Error;
 use header::{self, Headers};
-//use http;
+use http;
 use method::Method;
-//use net::{NetworkListener, NetworkStream, HttpListener, HttpsListener, Ssl};
+use net::{HttpsListener, Ssl, HttpsStream};
 use status::StatusCode;
 use uri::RequestUri;
 
@@ -140,8 +141,8 @@ mod conn;
 /// Once listening, it will create a `Request`/`Response` pair for each
 /// incoming connection, and hand them to the provided handler.
 #[derive(Debug)]
-pub struct Server {
-    listener: ::mio::tcp::TcpListener,
+pub struct Server<T: Transport> {
+    listener: T::Listener,
     _timeouts: Timeouts,
 }
 
@@ -166,20 +167,14 @@ macro_rules! try_option(
     }}
 );
 
-impl Server {
+impl<T: Transport> Server<T> {
     /// Creates a new server with the provided handler.
     #[inline]
-    pub fn new(listener: ::mio::tcp::TcpListener) -> Server {
+    pub fn new(listener: T::Listener) -> Server<T> {
         Server {
             listener: listener,
             _timeouts: Timeouts::default(),
         }
-    }
-
-    pub fn http(addr: &str) -> ::Result<Server> {
-        ::mio::tcp::TcpListener::bind(&addr.parse().unwrap())
-            .map(Server::new)
-            .map_err(From::from)
     }
 
     #[cfg(feature = "timeouts")]
@@ -195,41 +190,44 @@ impl Server {
 
 }
 
-/*
-impl Server<HttpListener> {
-    /// Creates a new server that will handle `HttpStream`s.
-    pub fn http<To: ToSocketAddrs>(addr: To) -> ::Result<Server<HttpListener>> {
-        HttpListener::new(addr).map(Server::new)
+impl Server<::mio::tcp::TcpStream> {
+    pub fn http(addr: &str) -> ::Result<Server<::mio::tcp::TcpStream>> {
+        ::mio::tcp::TcpListener::bind(&addr.parse().unwrap())
+            .map(Server::new)
+            .map_err(From::from)
     }
 }
 
-impl<S: Ssl + Clone + Send> Server<HttpsListener<S>> {
+
+/*
+impl<S: Ssl> Server<HttpsStream<S::Stream>> {
     /// Creates a new server that will handle `HttpStream`s over SSL.
     ///
     /// You can use any SSL implementation, as long as implements `hyper::net::Ssl`.
-    pub fn https<A: ToSocketAddrs>(addr: A, ssl: S) -> ::Result<Server<HttpsListener<S>>> {
+    pub fn https(addr: &SocketAddr, ssl: S) -> ::Result<Server<HttpsListener<S>>> {
         HttpsListener::new(addr, ssl).map(Server::new)
     }
 }
 */
 
-impl Server {
+impl<T: Transport> Server<T> {
     /// Binds to a socket and starts handling connections.
     pub fn handle<H: Handler + 'static>(self, handler: H) -> ::Result<Listening> {
         let handler = ::std::sync::Arc::new(handler);
-        let tick = try!(Tick::new());
-        let addr = try!(self.listener.local_addr());
-        let stream = tick.accept(self.listener)
-            .each(move |(write, read)| {
-                debug!("Socket start");
-                let handler = handler.clone();
-                self::conn::handle(write, read, handler);
-            }).map_err(|e| panic!("tick error: {:?}", e));
+        let mut tick = Tick::<T, _, _>::new(move |t| {
+            let handler = handler.clone();
+            http::Conn::new(t, conn::Conn::new(handler))
+        });
+        //let addr = try!(self.listener.local_addr());
+        try!(tick.accept(self.listener));
+        try!(tick.run());
+        unimplemented!();
+        /*
         Ok(Listening {
             addr: addr,
-            tick: Some(tick),
-            receiver: Some(stream),
+            tick: Some(Box::new(tick)),
         })
+        */
         //self.handle_threads(handler, num_cpus::get() * 5 / 4)
     }
 
@@ -246,8 +244,7 @@ impl Server {
 pub struct Listening {
     /// The address this server is listening on.
     pub addr: SocketAddr,
-    tick: Option<Tick>,
-    receiver: Option<::eventual::Future<(), ()>>,
+    //tick: Option<Box<Tick<F, P, T>>>
 }
 
 impl fmt::Debug for Listening {
@@ -260,10 +257,11 @@ impl fmt::Debug for Listening {
 
 impl Drop for Listening {
     fn drop(&mut self) {
-        let _ = self.receiver.take().map(|s| s.await());
+        //let _ = self.tick.take().map(|t| t.run());
     }
 }
 
+/*
 impl Listening {
     /// Starts the Server, blocking until it is shutdown.
     pub fn start(self) {
@@ -275,6 +273,8 @@ impl Listening {
         self.tick.take();
     }
 }
+
+*/
 /*
 struct Worker<H: Handler + 'static> {
     handler: H,

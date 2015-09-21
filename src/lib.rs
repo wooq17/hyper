@@ -161,7 +161,7 @@ extern crate test;
 
 
 pub use url::Url;
-pub use client::Client;
+//pub use client::Client;
 pub use error::{Result, Error};
 pub use method::Method::{Get, Head, Post, Delete};
 pub use status::StatusCode::{Ok, BadRequest, NotFound};
@@ -187,7 +187,7 @@ macro_rules! inspect(
 mod mock;
 #[doc(hidden)]
 pub mod buffer;
-pub mod client;
+//pub mod client;
 pub mod error;
 pub mod method;
 pub mod header;
@@ -203,6 +203,7 @@ pub mod mime {
     pub use mime_crate::*;
 }
 
+/*
 #[allow(unconditional_recursion)]
 fn _assert_send<T: Send>() {
     _assert_send::<Client>();
@@ -216,3 +217,4 @@ fn _assert_sync<T: Sync>() {
     _assert_sync::<Client>();
     _assert_sync::<error::Error>();
 }
+*/

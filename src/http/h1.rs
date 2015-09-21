@@ -16,7 +16,7 @@ use Error;
 use header::{Headers, ContentLength, TransferEncoding};
 use header::Encoding::Chunked;
 use method::{Method};
-use net::{NetworkConnector, NetworkStream};
+//use net::{NetworkConnector, NetworkStream};
 use status::StatusCode;
 use version::HttpVersion;
 use version::HttpVersion::{Http10, Http11};
@@ -37,6 +37,7 @@ use version;
 
 const MAX_INVALID_RESPONSE_BYTES: usize = 1024 * 128;
 
+/*
 /// An implementation of the `HttpMessage` trait for HTTP/1.1.
 #[derive(Debug)]
 pub struct Http11Message {
@@ -396,7 +397,7 @@ impl NetworkConnector for Connector {
         Ok(try!(self.0.connect(host, port, scheme)).into())
     }
 }
-
+*/
 
 /// Readers to handle different Transfer-Encodings.
 ///
@@ -808,7 +809,7 @@ pub fn parse_response(buf: &[u8]) -> ::Result<Option<(Incoming<RawStatus>, usize
     parse::<httparse::Response, RawStatus>(buf)
 }
 
-fn parse<T: TryParse<Subject=I>, I>(rdr: &[u8]) -> ::Result<Option<(Incoming<I>, usize)>> {
+pub fn parse<T: TryParse<Subject=I>, I>(rdr: &[u8]) -> ::Result<Option<(Incoming<I>, usize)>> {
     match try!(try_parse::<T, I>(rdr)) {
         httparse::Status::Complete((inc, len)) => {
             Ok(Some((inc, len)))
@@ -826,14 +827,13 @@ fn try_parse<T: TryParse<Subject=I>, I>(buf: &[u8]) -> TryParseResult<I> {
     <T as TryParse>::try_parse(&mut headers, buf)
 }
 
-#[doc(hidden)]
-trait TryParse {
+pub trait TryParse {
     type Subject;
     fn try_parse<'a>(headers: &'a mut [httparse::Header<'a>], buf: &'a [u8]) ->
         TryParseResult<Self::Subject>;
 }
 
-type TryParseResult<T> = Result<httparse::Status<(Incoming<T>, usize)>, Error>;
+pub type TryParseResult<T> = Result<httparse::Status<(Incoming<T>, usize)>, Error>;
 
 impl<'a> TryParse for httparse::Request<'a, 'a> {
     type Subject = (Method, RequestUri);

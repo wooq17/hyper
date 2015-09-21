@@ -163,7 +163,8 @@ impl From<TickError> for Error {
     fn from(err: TickError) -> Error {
         match err {
             TickError::Io(e) => Error::Io(e),
-            TickError::TooManySockets => panic!("too many sockets, what do i do")
+            TickError::TooManySockets => panic!("too many sockets, what do i do"),
+            TickError::Timeout => panic!("too many timeouts, what do i do")
         }
     }
 }
