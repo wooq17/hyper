@@ -5,7 +5,7 @@
 use std::any::{Any, TypeId};
 use std::marker::PhantomData;
 use std::mem;
-use std::io::Write;
+use std::io::{Write, BufWriter};
 use std::ptr;
 
 use time::now_utc;
@@ -34,7 +34,7 @@ pub struct Response< W: Any = Fresh> {
     // The outgoing headers on this response.
     headers: header::Headers,
 
-    body: HttpWriter<AsyncWriter>,
+    body: HttpWriter<BufWriter<AsyncWriter>>,
 
     _writing: PhantomData<W>
 }
@@ -67,7 +67,7 @@ impl<W: Any> Response<W> {
 
     /// Deconstruct this Response into its constituent parts.
     #[inline]
-    pub fn deconstruct(self) -> (version::HttpVersion, HttpWriter<AsyncWriter>,
+    pub fn deconstruct(self) -> (version::HttpVersion, HttpWriter<BufWriter<AsyncWriter>>,
                                  status::StatusCode, header::Headers) {
         unsafe {
             let parts = (
@@ -140,7 +140,7 @@ impl Response<Fresh> {
             status: status::StatusCode::Ok,
             version: version::HttpVersion::Http11,
             headers: header::Headers::new(),
-            body: HttpWriter::ThroughWriter(AsyncWriter::new(tx)),
+            body: HttpWriter::ThroughWriter(BufWriter::with_capacity(4096, AsyncWriter::new(tx))),
             _writing: PhantomData,
         }
     }
@@ -230,10 +230,11 @@ impl<T: Any> Drop for Response<T> {
             self.headers.set(header::ContentLength(0));
             let _body = self.write_head();
         };
+
         // AsyncWriter will flush on drop
         if !http::should_keep_alive(self.version, &self.headers) {
-            trace!("should not keep alive, closing");
-            self.body.get_mut().get_mut().close();
+            trace!("not keep alive, closing");
+            self.body.get_mut().get_mut().get_mut().close();
         }
     }
 }
