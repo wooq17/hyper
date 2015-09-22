@@ -108,13 +108,13 @@
 //! `Request<Streaming>` object, that no longer has `headers_mut()`, but does
 //! implement `Write`.
 use std::fmt;
-use std::io::{/*self, ErrorKind, BufWriter, Write,*/ Read, Cursor};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::thread;
 
 #[cfg(feature = "timeouts")]
 use std::time::Duration;
 
-//use num_cpus;
+use num_cpus;
 
 use mio::{self, TryAccept};
 use tick::{Tick, Transport};
@@ -210,34 +210,39 @@ impl<S: Ssl> Server<HttpsStream<S::Stream>> {
 }
 */
 
-impl<T: Transport> Server<T> {
+
+//impl<T: Transport> Server<T> {
+impl Server<::mio::tcp::TcpStream> {
     /// Binds to a socket and starts handling connections.
     pub fn handle<H: Handler + 'static>(self, handler: H) -> ::Result<Listening> {
-        let handler = ::std::sync::Arc::new(handler);
-        let mut tick = Tick::<T, _, _>::new(move |t| {
-            let handler = handler.clone();
-            http::Conn::new(t, conn::Conn::new(handler))
-        });
-        //let addr = try!(self.listener.local_addr());
-        try!(tick.accept(self.listener));
-        try!(tick.run());
-        unimplemented!();
-        /*
-        Ok(Listening {
-            addr: addr,
-            tick: Some(Box::new(tick)),
-        })
-        */
-        //self.handle_threads(handler, num_cpus::get() * 5 / 4)
+        self.handle_threads(handler, num_cpus::get() * 5 / 4)
     }
 
-    /*
     /// Binds to a socket and starts handling connections with the provided
     /// number of threads.
     pub fn handle_threads<H: Handler + 'static>(self, handler: H, threads: usize) -> ::Result<Listening> {
-        handle(self, handler, threads)
+        let handler = ::std::sync::Arc::new(handler);
+        let mut handles = vec![];
+        for _ in 0..threads {
+            let listener = try!(self.listener.try_clone());
+            let handler = handler.clone();
+            handles.push(thread::spawn(move || {
+                let mut tick = Tick::<::mio::tcp::TcpStream, _, _>::new(move |t| {
+                    let handler = handler.clone();
+                    http::Conn::new(t, conn::Conn::new(handler))
+                });
+                //let addr = try!(self.listener.local_addr());
+                tick.accept(listener).unwrap();
+                tick.run().unwrap();
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        unimplemented!();
     }
-    */
 }
 
 /// A handle of the running server.
