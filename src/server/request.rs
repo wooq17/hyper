@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use version::{HttpVersion};
 use method::Method::{self, Get, Head};
 use header::{Headers, ContentLength, TransferEncoding};
-use http::h1::{Incoming, HttpReader};
-use http::h1::HttpReader::{SizedReader, ChunkedReader, EmptyReader};
+use http::{IncomingRequest, Incoming};
+//use http::h1::HttpReader::{SizedReader, ChunkedReader, EmptyReader};
 use uri::RequestUri;
 
 /// A request bundles several parts of an incoming `NetworkStream`, given to a `Handler`.
@@ -33,7 +33,7 @@ pub struct Request {
 impl Request {
     /// Create a new Request, reading the StartLine and Headers so they are
     /// immediately useful.
-    pub fn new(incoming: Incoming<(Method, RequestUri)>) -> Request {
+    pub fn new(incoming: IncomingRequest) -> Request {
         let Incoming { version, subject: (method, uri), headers } = incoming;
         debug!("Request Line: {:?} {:?} {:?}", method, uri, version);
         debug!("{:#?}", headers);

@@ -1,22 +1,25 @@
+use std::fmt;
 use std::io::Cursor;
 use std::sync::mpsc;
 
-use tick::{Transfer, Protocol};
+use tick::{self, Protocol};
 
-use http::h1::{self as http, Incoming, TryParse};
+use http::{self, Incoming, Parse};
+use net::Fresh;
 
 const MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
 
 pub struct Conn<H: Handler> {
-    transfer: Lend<Transfer>,
+    transfer: Lend<tick::Transfer>,
     state: State,
     buffer: Cursor<Vec<u8>>,
     handler: H,
 }
 
 
+
 impl<H: Handler> Conn<H> {
-    pub fn new(transfer: Transfer, handler: H) -> Conn<H> {
+    pub fn new(transfer: tick::Transfer, handler: H) -> Conn<H> {
         Conn {
             transfer: Lend::Owned(transfer),
             state: State::Parsing,
@@ -39,7 +42,7 @@ impl<H: Handler> Protocol for Conn<H> {
                     Ok(Some((incoming, len))) => {
                         self.buffer.set_position(len as u64);
                         let lease = self.transfer.lease();
-                        self.handler.on_incoming(incoming, lease);
+                        self.handler.on_incoming(incoming, http::h1::transfer(lease));
                         self.state = State::Handling;
                     },
                     Ok(None) => {
@@ -69,10 +72,11 @@ impl<H: Handler> Protocol for Conn<H> {
 }
 
 pub trait Handler {
-    type Parse: TryParse;
+    type Parse: Parse;
+    type Type;
     fn on_incoming(&mut self,
-                   incoming: Incoming<<Self::Parse as TryParse>::Subject>,
-                   transfer: Lease<Transfer>);
+                   incoming: Incoming<<Self::Parse as Parse>::Subject>,
+                   transfer: http::Transfer<Self::Type, Fresh>);
 
     fn on_body(&mut self, data: &[u8]) -> usize;
 }
@@ -124,6 +128,14 @@ impl<T> Lease<T> {
             inner: Some(inner),
             tx: tx,
         }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Lease<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Lease")
+            .field("inner", self.inner.as_ref().unwrap())
+            .finish()
     }
 }
 

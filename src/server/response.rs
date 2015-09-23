@@ -3,7 +3,6 @@
 //! These are responses sent by a `hyper::Server` to clients, after
 //! receiving a request.
 use std::any::{Any, TypeId};
-use std::marker::PhantomData;
 use std::mem;
 use std::io::{Write, BufWriter};
 use std::ptr;
@@ -11,8 +10,7 @@ use std::ptr;
 use time::now_utc;
 
 use header;
-use http::{self, AsyncWriter};
-use http::h1::HttpWriter::{self, ThroughWriter, ChunkedWriter, SizedWriter};
+use http;
 use status;
 use net::{Fresh, Streaming};
 use version;
@@ -26,7 +24,7 @@ use version;
 /// write the head and flush the body, if the handler has not already done so,
 /// so that the server doesn't accidentally leave dangling requests.
 #[derive(Debug)]
-pub struct Response< W: Any = Fresh> {
+pub struct Response<W: Any = Fresh> {
     /// The HTTP version of this response.
     pub version: version::HttpVersion,
     // The status code for the request.
@@ -34,9 +32,7 @@ pub struct Response< W: Any = Fresh> {
     // The outgoing headers on this response.
     headers: header::Headers,
 
-    body: HttpWriter<BufWriter<AsyncWriter>>,
-
-    _writing: PhantomData<W>
+    body: http::Transfer<http::Response, W>,
 }
 
 impl<W: Any> Response<W> {
@@ -60,14 +56,13 @@ impl<W: Any> Response<W> {
             version: version,
             body: body,
             headers: headers,
-            _writing: PhantomData,
         }
     }
     */
 
     /// Deconstruct this Response into its constituent parts.
     #[inline]
-    pub fn deconstruct(self) -> (version::HttpVersion, HttpWriter<BufWriter<AsyncWriter>>,
+    pub fn deconstruct(self) -> (version::HttpVersion, http::Transfer<http::Response, W>,
                                  status::StatusCode, header::Headers) {
         unsafe {
             let parts = (
@@ -80,68 +75,18 @@ impl<W: Any> Response<W> {
             parts
         }
     }
-
-    fn write_head(&mut self) -> Body {
-        debug!("writing head: {:?} {:?}", self.version, self.status);
-        let _ = write!(&mut self.body, "{} {}\r\n", self.version, self.status);
-
-        if !self.headers.has::<header::Date>() {
-            self.headers.set(header::Date(header::HttpDate(now_utc())));
-        }
-
-
-
-        let mut body = Body::Chunked;
-        if let Some(cl) = self.headers.get::<header::ContentLength>() {
-            body = Body::Sized(**cl);
-        }
-
-        if body == Body::Chunked {
-            let encodings = match self.headers.get_mut::<header::TransferEncoding>() {
-                Some(&mut header::TransferEncoding(ref mut encodings)) => {
-                    //TODO: check if chunked is already in encodings. use HashSet?
-                    encodings.push(header::Encoding::Chunked);
-                    false
-                },
-                None => true
-            };
-
-            if encodings {
-                self.headers.set(header::TransferEncoding(vec![header::Encoding::Chunked]));
-            }
-            body = Body::Chunked;
-        }
-
-
-        debug!("{:#?}", self.headers);
-        let _ = write!(&mut self.body, "{}\r\n", self.headers);
-
-        body
-    }
-
-    fn write_async(&mut self, data: &[u8]) {
-        if let Err(e) = self.body.write(data) {
-            warn!("write_async err={:?}", e);
-        }
-    }
 }
 
-#[derive(PartialEq, Debug)]
-enum Body {
-    Sized(u64),
-    Chunked
-}
 
 impl Response<Fresh> {
     /// Creates a new Response that can be used to write to a network stream.
     #[inline]
-    pub fn new(tx: http::Transfer) -> Response<Fresh> {
+    pub fn new(tx: http::Transfer<http::Response, Fresh>) -> Response<Fresh> {
         Response {
             status: status::StatusCode::Ok,
             version: version::HttpVersion::Http11,
             headers: header::Headers::new(),
-            body: HttpWriter::ThroughWriter(BufWriter::with_capacity(4096, AsyncWriter::new(tx))),
-            _writing: PhantomData,
+            body: tx,
         }
     }
 
@@ -181,20 +126,13 @@ impl Response<Fresh> {
     /// Consume this Response<Fresh>, writing the Headers and Status and
     /// creating a Response<Streaming>
     pub fn start(mut self) -> Response<Streaming> {
-        let body_type = self.write_head();
-        let (version, body, status, headers) = self.deconstruct();
-        let stream = match body_type {
-            Body::Chunked => ChunkedWriter(body.into_inner()),
-            Body::Sized(len) => SizedWriter(body.into_inner(), len)
-        };
-
-        // "copy" to change the phantom type
+        let (version, body, status, mut headers) = self.deconstruct();
+        let body = body.start(version, status, &mut headers);
         Response {
             version: version,
             status: status,
             headers: headers,
-            body: stream,
-            _writing: PhantomData,
+            body: body
         }
     }
 
@@ -212,7 +150,7 @@ impl Response<Streaming> {
     /// Asynchronously write bytes to the response.
     #[inline]
     pub fn write(&mut self, data: &[u8]) {
-        self.write_async(data)
+        self.body.write(data)
     }
 
     /// Asynchonously flushes all writing of a response to the client.
@@ -223,19 +161,26 @@ impl Response<Streaming> {
 }
 
 
-
 impl<T: Any> Drop for Response<T> {
     fn drop(&mut self) {
         if TypeId::of::<T>() == TypeId::of::<Fresh>() {
-            self.headers.set(header::ContentLength(0));
-            let _body = self.write_head();
+            let res = unsafe { ptr::read(self) };
+            mem::forget(self);
+            let (version, body, status, mut headers) = res.deconstruct();
+            headers.set(header::ContentLength(0));
+            let body = unsafe {
+                mem::transmute::<_, http::Transfer<http::Response, Fresh>>(body)
+            };
+            body.start(version, status, &mut headers);
         };
 
+        /* TODO: this should happen in http::Transfer
         // AsyncWriter will flush on drop
         if !http::should_keep_alive(self.version, &self.headers) {
             trace!("not keep alive, closing");
             self.body.get_mut().get_mut().get_mut().close();
         }
+        */
     }
 }
 

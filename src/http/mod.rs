@@ -1,9 +1,13 @@
 //! Pieces pertaining to the HTTP message protocol.
 use std::borrow::Cow;
 
+use tick;
+
 use header::Connection;
 use header::ConnectionOption::{KeepAlive, Close};
 use header::Headers;
+use method::Method;
+use uri::RequestUri;
 use version::HttpVersion;
 use version::HttpVersion::{Http10, Http11};
 
@@ -11,14 +15,38 @@ use version::HttpVersion::{Http10, Http11};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::conn::{Conn, Handler};
-pub use self::message::{HttpMessage, RequestHead, ResponseHead, Protocol};
 
 pub mod conn;
 pub mod h1;
 //pub mod h2;
-pub mod message;
 
-pub type Transfer = self::conn::Lease<::tick::Transfer>;
+// pub enum Transfer { Http11(h1::Transfer), Http2(h2::Transfer) }
+pub use self::h1::Transfer;
+
+/// Marker used with http::Transfer to define its Writer semantics.
+#[derive(Debug)]
+pub enum Request {}
+/// Marker used with http::Transfer to define its Writer semantics.
+#[derive(Debug)]
+pub enum Response {}
+
+/// An Incoming Message head. Includes request/status line, and headers.
+#[derive(Debug)]
+pub struct Incoming<S> {
+    /// HTTP version of the message.
+    pub version: HttpVersion,
+    /// Subject (request line or status line) of Incoming message.
+    pub subject: S,
+    /// Headers of the Incoming message.
+    pub headers: Headers
+}
+
+/// An incoming request message.
+pub type IncomingRequest = Incoming<(Method, RequestUri)>;
+
+/// An incoming response message.
+pub type IncomingResponse = Incoming<RawStatus>;
+
 
 /// The raw status code and reason-phrase.
 #[derive(Clone, PartialEq, Debug)]
@@ -51,17 +79,19 @@ pub fn should_keep_alive(version: HttpVersion, headers: &Headers) -> bool {
     }
 }
 
+pub type LeasedTransfer = ::http::conn::Lease<::tick::Transfer>;
+
 pub struct AsyncWriter {
-    transfer: Transfer,
+    transfer: LeasedTransfer,
 }
 
 impl AsyncWriter {
-    pub fn new(transfer: Transfer) -> AsyncWriter {
+    pub fn new(transfer: LeasedTransfer) -> AsyncWriter {
         AsyncWriter { transfer: transfer }
     }
 
-    pub fn get_mut(&mut self) -> &mut Transfer {
-        &mut self.transfer
+    pub fn get_mut(&mut self) -> &mut tick::Transfer {
+        &mut *self.transfer
     }
 }
 
@@ -75,6 +105,18 @@ impl ::std::io::Write for AsyncWriter {
     fn flush(&mut self) -> ::std::io::Result<()> {
         Ok(())
     }
+}
+
+pub trait Parse {
+    type Subject;
+    fn parse(bytes: &[u8]) -> ParseResult<Self::Subject>;
+}
+
+pub type ParseResult<T> = ::Result<Option<(Incoming<T>, usize)>>;
+
+pub fn parse<T: Parse<Subject=I>, I>(rdr: &[u8]) -> ParseResult<I> {
+    //TODO: try h2::parse()
+    h1::parse::<T, I>(rdr)
 }
 
 #[test]

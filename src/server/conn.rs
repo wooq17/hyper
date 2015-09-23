@@ -4,9 +4,8 @@ use std::sync::Arc;
 use httparse;
 
 use header;
-use http::{self, Transfer};
-use method::Method;
-use uri::RequestUri;
+use http;
+use net;
 
 use super::{Handler, Request, Response};
 
@@ -24,8 +23,9 @@ impl<H: Handler> Conn<H> {
 
 impl<H: Handler> http::Handler for Conn<H> {
     type Parse = httparse::Request<'static, 'static>;
+    type Type = http::Response;
 
-    fn on_incoming(&mut self, incoming: http::h1::Incoming<(Method, RequestUri)>, transfer: Transfer) {
+    fn on_incoming(&mut self, incoming: http::IncomingRequest, transfer: http::Transfer<http::Response, net::Fresh>) {
         let request = Request::new(incoming);
         let response = Response::new(transfer);
         self.handler.handle(request, response);
